@@ -1,114 +1,51 @@
-import json
 import os
+import sys
 from base64 import b64decode
 from binascii import Error as Base64DecodeError
-from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from google import genai
-from google.genai import types
-from PIL import Image, UnidentifiedImageError
-
+from werkzeug.exceptions import RequestEntityTooLarge
 
 BASE_DIR = Path(__file__).resolve().parent
-PUBLIC_DIR = BASE_DIR.parent / "public"
+ROOT_DIR = BASE_DIR.parent
+PUBLIC_DIR = ROOT_DIR / "public"
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from PROJECT.evaluate import evaluate_labelled_samples, score_pair  # noqa: E402
+from PROJECT.ocr import (  # noqa: E402
+    MODEL_ID,
+    OcrError,
+    decode_image,
+    load_model,
+    model_loaded,
+    recognize_image,
+    transformers_compatibility,
+)
 
 load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR.parent / ".env")
 
 app = Flask(__name__, static_folder=None)
-CORS(app, resources={r"/run-ocr": {"origins": os.getenv("CORS_ORIGINS", "*")}})
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+CORS(
+    app,
+    resources={
+        r"/run-ocr": {"origins": os.getenv("CORS_ORIGINS", "*")},
+        r"/health": {"origins": os.getenv("CORS_ORIGINS", "*")},
+        r"/evaluate": {"origins": os.getenv("CORS_ORIGINS", "*")},
+        r"/score": {"origins": os.getenv("CORS_ORIGINS", "*")},
+    },
+)
 
 
-def get_genai_client():
-    if not os.getenv("GEMINI_API_KEY"):
-        return None, "GEMINI_API_KEY environment variable is not set on the server."
-
-    try:
-        return genai.Client(), None
-    except Exception as exc:
-        app.logger.exception("Failed to initialize Gemini client")
-        return None, f"Error initializing Gemini client: {exc.__class__.__name__}"
-
-
-def run_gemini_ocr(base64_image_data: str, mime_type: str) -> dict:
-    try:
-        image_bytes = b64decode(base64_image_data, validate=True)
-        image = Image.open(BytesIO(image_bytes))
-        image.verify()
-        image = Image.open(BytesIO(image_bytes))
-
-        ocr_schema = types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "extractedText": types.Schema(
-                    type=types.Type.STRING,
-                    description=(
-                        "The complete, accurately extracted text from the image, "
-                        "preserving line breaks. Use \\n for line breaks."
-                    ),
-                )
-            },
-            required=["extractedText"],
-        )
-
-        config = types.GenerateContentConfig(
-            system_instruction=(
-                "You are an AI-powered text recognition engine specialized in "
-                "high-accuracy OCR, particularly for handwritten text. Extract all "
-                "text from the image."
-            ),
-            response_mime_type="application/json",
-            response_schema=ocr_schema,
-        )
-
-        client, client_err = get_genai_client()
-        if client_err:
-            return {"error": client_err}
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                (
-                    "Extract all text from the image, including line breaks, and "
-                    "return the result as a single JSON object structured exactly "
-                    "as requested. Focus on accurate text extraction regardless of "
-                    "the text's style (handwritten or printed)."
-                ),
-                image,
-            ],
-            config=config,
-        )
-
-        text = (response.text or "").strip()
-        if text.startswith("```json"):
-            text = text[7:-3].strip()
-        elif text.startswith("```"):
-            text = text[3:-3].strip()
-
-        parsed_model_output = json.loads(text)
-        extracted_text = parsed_model_output.get(
-            "extractedText", "No text could be extracted."
-        )
-
-        return {"extractedText": extracted_text}
-
-    except (Base64DecodeError, UnidentifiedImageError):
-        return {"error": "Invalid image data."}
-    except genai.errors.APIError as exc:
-        app.logger.exception("Gemini API error")
-        return {
-            "error": (
-                f"API Error: {exc.__class__.__name__}. "
-                "Check your API key or usage limits."
-            )
-        }
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        app.logger.exception("Gemini returned an invalid OCR payload")
-        return {"error": f"Invalid OCR response: {exc.__class__.__name__}"}
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(error):
+    app.logger.warning("Rejected oversized request: %s", error.description)
+    return jsonify({"error": "Request is too large. The maximum image size is 8 MB."}), 413
 
 
 @app.get("/")
@@ -116,30 +53,95 @@ def index():
     return send_from_directory(PUBLIC_DIR, "index.html")
 
 
+@app.get("/health")
+def health():
+    info = transformers_compatibility()
+    return jsonify(
+        {
+            "ok": True,
+            "model": MODEL_ID,
+            "modelLoaded": model_loaded(),
+            "transformersCompatible": info["compatible"],
+            "transformersVersion": info["transformersVersion"],
+            "torchVersion": info["torchVersion"],
+            "notes": info["notes"],
+        }
+    )
+
+
 @app.post("/run-ocr")
 def run_ocr_endpoint():
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
 
-    data = request.get_json(silent=True) or {}
-    base64_data_with_prefix = data.get("imageBase64")
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+
+    image_data = data.get("imageBase64")
     mime_type = data.get("fileMimeType")
 
-    if not base64_data_with_prefix or not mime_type:
+    if not isinstance(image_data, str) or not image_data.strip():
+        return jsonify({"error": "Missing image data or MIME type in request."}), 400
+    if not isinstance(mime_type, str) or not mime_type.strip():
         return jsonify({"error": "Missing image data or MIME type in request."}), 400
 
-    _, _, base64_data = base64_data_with_prefix.partition(",")
-    result = run_gemini_ocr(base64_data or base64_data_with_prefix, mime_type)
+    mime_type = mime_type.strip().lower()
+    if image_data.startswith("data:"):
+        header, separator, payload = image_data.partition(",")
+        if not separator or ";base64" not in header.lower():
+            return jsonify({"error": "Invalid image data URL."}), 400
+        data_url_mime_type = header[5:].split(";", 1)[0].lower()
+        if data_url_mime_type != mime_type:
+            return jsonify({"error": "Image data URL MIME type does not match fileMimeType."}), 400
+    else:
+        payload = image_data
 
-    if "error" in result:
-        status_code = 400 if result["error"] == "Invalid image data." else 500
-        return jsonify(result), status_code
+    try:
+        image_bytes = b64decode(payload, validate=True)
+        image = decode_image(image_bytes, mime_type)
+        result = recognize_image(image)
+        return jsonify(result.to_api_dict())
+    except (Base64DecodeError, ValueError):
+        return jsonify({"error": "Invalid image data."}), 400
+    except OcrError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+    except Exception:
+        app.logger.exception("Unexpected OCR failure")
+        return jsonify({"error": "Recognition failed unexpectedly. Try another image."}), 500
 
-    return jsonify(result)
+
+@app.post("/score")
+def score_endpoint():
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    reference = data.get("reference")
+    hypothesis = data.get("hypothesis")
+    if not isinstance(reference, str) or not isinstance(hypothesis, str):
+        return jsonify({"error": "Provide reference and hypothesis strings."}), 400
+    return jsonify(score_pair(reference, hypothesis))
+
+
+@app.post("/evaluate")
+def evaluate_endpoint():
+    try:
+        return jsonify(evaluate_labelled_samples())
+    except OcrError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+    except Exception:
+        app.logger.exception("Evaluation failed")
+        return jsonify({"error": "Could not run labelled evaluation."}), 500
 
 
 def main():
-    app.run(debug=True)
+    try:
+        load_model()
+    except OcrError as exc:
+        app.logger.error("Model was not preloaded: %s", exc.message)
+    app.run(debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":

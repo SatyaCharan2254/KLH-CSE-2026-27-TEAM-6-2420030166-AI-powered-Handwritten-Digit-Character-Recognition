@@ -1,0 +1,22 @@
+[
+  {
+    "file": "line_hello.png",
+    "text": "hello",
+    "kind": "synthetic-font"
+  },
+  {
+    "file": "line_quick.png",
+    "text": "the quick brown fox",
+    "kind": "synthetic-font"
+  },
+  {
+    "file": "line_digits.png",
+    "text": "item 42",
+    "kind": "synthetic-font"
+  },
+  {
+    "file": "multiline_hello_world.png",
+    "text": "hello\nworld",
+    "kind": "synthetic-font"
+  }
+]

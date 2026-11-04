@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flask OCR (TrOCR)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "PROJECT.server",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "Evaluate labelled samples",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "PROJECT.evaluate",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    }
+  ]
+}

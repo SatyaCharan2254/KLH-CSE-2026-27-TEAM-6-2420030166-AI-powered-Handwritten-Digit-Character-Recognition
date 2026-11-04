@@ -1,0 +1,16 @@
+{
+  "dataset": "Teklia/IAM-line",
+  "split": "test",
+  "model_id": "microsoft/trocr-small-handwritten",
+  "device": "cpu",
+  "model_device_attribute": "cpu",
+  "total_evaluated_samples": 100,
+  "successful_evaluations": 100,
+  "failed_evaluations": 0,
+  "mean_cer": 0.0651,
+  "mean_wer": 0.1674,
+  "exact_match_accuracy": 0.35,
+  "average_inference_time_ms": 555.24,
+  "total_wall_time_seconds": 59.7,
+  "errors": []
+}
